@@ -1,7 +1,7 @@
 const nodemailer = require('nodemailer');
 const logger = require('../utils/logger');
 
-const transporter = nodemailer.createTransporter({
+const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'localhost',
   port: parseInt(process.env.SMTP_PORT || '1025'),
   secure: process.env.SMTP_SECURE === 'true',

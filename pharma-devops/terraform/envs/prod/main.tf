@@ -16,7 +16,7 @@ module "eks" {
 
   project            = "pharma"
   env                = "prod"
-  cluster_version    = "1.29"
+  cluster_version    = "1.33"
   subnet_ids         = module.vpc.private_eks_subnet_ids
   node_instance_type = "t3.medium"
   desired_capacity   = 2

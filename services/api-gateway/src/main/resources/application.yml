@@ -8,21 +8,22 @@ spring:
     gateway:
       routes:
         - id: auth-service
-          uri: ${{AUTH_SERVICE_URL:http://auth-service:8081}}
+          uri: "${AUTH_SERVICE_URL:http://auth-service:8081}"
           predicates:
             - Path=/api/auth/**
           filters:
             - StripPrefix=0
 
         - id: drug-catalog-service
-          uri: ${{DRUG_CATALOG_URL:http://drug-catalog-service:8082}}
+          uri: "${DRUG_CATALOG_URL:http://drug-catalog-service:8082}"
           predicates:
             - Path=/api/drugs/**
           filters:
             - AuthFilter
+            - RewritePath=/api/drugs(?<segment>/?.*), /api/drug/catalog${segment}
 
         - id: notification-service
-          uri: ${{NOTIFICATION_URL:http://notification-service:3000}}
+          uri: "${NOTIFICATION_URL:http://notification-service:3000}"
           predicates:
             - Path=/api/notifications/**
           filters:
@@ -37,7 +38,7 @@ spring:
 
 auth:
   service:
-    url: ${{AUTH_SERVICE_URL:http://auth-service:8081}}
+    url: "${AUTH_SERVICE_URL:http://auth-service:8081}"
 
 management:
   endpoints:

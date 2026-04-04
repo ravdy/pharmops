@@ -423,7 +423,7 @@ terraform apply tfplan
 
 Review the plan — you should see:
 - 1 VPC, 6 subnets, 1 NAT Gateway, route tables
-- 1 EKS cluster + managed node group (2x t3.medium)
+- 1 EKS cluster + managed node group (2x t3.small)
 - 1 RDS PostgreSQL db.t3.micro
 - 5 ECR repositories
 - IAM roles (IRSA for ESO, GitHub Actions OIDC)
@@ -439,7 +439,7 @@ Review the plan — you should see:
 ```bash
 terraform output
 
-export EKS_CLUSTER_NAME="pharma-dev"
+export EKS_CLUSTER_NAME="pharma-dev-cluster"
 export RDS_ENDPOINT=$(terraform output -raw rds_endpoint)
 export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
@@ -452,7 +452,7 @@ echo "ECR: $ECR_REGISTRY"
 ```powershell
 terraform output
 
-$env:EKS_CLUSTER_NAME = "pharma-dev"
+$env:EKS_CLUSTER_NAME = "pharma-dev-cluster"
 $env:RDS_ENDPOINT = (terraform output -raw rds_endpoint)
 $env:ECR_REGISTRY = "$env:AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com"
 
@@ -471,16 +471,16 @@ Write-Host "ECR: $env:ECR_REGISTRY"
 ```bash
 aws eks update-kubeconfig \
   --region us-east-1 \
-  --name pharma-dev \
-  --alias pharma-dev
+  --name pharma-dev-cluster \
+  --alias pharma-dev-cluster
 ```
 
 **Windows PowerShell:**
 ```powershell
 aws eks update-kubeconfig `
   --region us-east-1 `
-  --name pharma-dev `
-  --alias pharma-dev
+  --name pharma-dev-cluster `
+  --alias pharma-dev-cluster
 ```
 
 ---
@@ -494,7 +494,7 @@ kubectl get nodes
 # Should show 2 nodes: STATUS = Ready
 
 kubectl get nodes -o wide
-# Verify instance type: t3.medium
+# Verify instance type: t3.small
 ```
 
 ---
