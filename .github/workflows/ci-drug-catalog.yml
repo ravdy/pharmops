@@ -1,0 +1,168 @@
+##############################################################################
+# CI/CD Pipeline — drug-catalog-service  (Spring Boot / Maven)
+#
+# Note: QA and Prod values files for catalog-service do not yet exist in
+# pharmops-gitops/envs/qa/ and envs/prod/.  The promote-qa and promote-prod
+# jobs create them if missing, using the dev values file as a base.
+##############################################################################
+name: "CI/CD — drug-catalog-service"
+
+on:
+  push:
+    branches:
+      - develop
+      - "release/**"
+      - main
+    paths:
+      - "services/drug-catalog-service/**"
+      - ".github/workflows/ci-drug-catalog.yml"
+      - ".github/workflows/_java-build.yml"
+  pull_request:
+    branches:
+      - develop
+    paths:
+      - "services/drug-catalog-service/**"
+
+concurrency:
+  group: drug-catalog-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/_java-build.yml
+    with:
+      service_name:   drug-catalog-service
+      ecr_repository: drug-catalog-service
+      docker_context: services/drug-catalog-service
+    secrets:
+      AWS_ACCOUNT_ID:          ${{ secrets.AWS_ACCOUNT_ID }}
+      GITHUB_ACTIONS_ROLE_ARN: ${{ secrets.GITHUB_ACTIONS_ROLE_ARN }}
+
+  deploy-dev:
+    name: "Deploy → DEV"
+    needs: build
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    envs/dev/values-catalog-service.yaml
+          yq_expression:  ".image.tag = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_tag }}
+          commit_message: "ci(drug-catalog): dev → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          chmod +x /usr/local/bin/argocd
+      - name: Wait for ArgoCD DEV sync
+        env:
+          ARGOCD_SERVER:     ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_OPTS:       "--grpc-web"
+        # Catalog service uses Flyway migrations — longer startup, increase timeout
+        run: argocd app wait catalog-service-dev --health --sync --timeout 420
+
+  promote-qa:
+    name: "Promote → QA"
+    needs: [build, deploy-dev]
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - uses: actions/checkout@v4
+      # values-catalog-service.yaml does not exist in envs/qa yet.
+      # Seed it from the dev values file, then patch the tag.
+      - name: Seed QA values file if missing
+        run: |
+          git clone \
+            "https://x-access-token:${{ secrets.GITOPS_TOKEN }}@github.com/${{ github.repository_owner }}/pharmops-gitops.git" \
+            _gitops
+          if [ ! -f _gitops/envs/qa/values-catalog-service.yaml ]; then
+            cp _gitops/envs/dev/values-catalog-service.yaml \
+               _gitops/envs/qa/values-catalog-service.yaml
+            # Switch to QA profile
+            sudo wget -qO /usr/local/bin/yq \
+              https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+            yq e -i '.configmap.SPRING_PROFILES_ACTIVE = "qa"' \
+              _gitops/envs/qa/values-catalog-service.yaml
+            yq e -i '.configmap.LOG_LEVEL = "INFO"' \
+              _gitops/envs/qa/values-catalog-service.yaml
+            cd _gitops
+            git config user.name  "pharma-ci-bot"
+            git config user.email "ci-bot@pharma.internal"
+            git add envs/qa/values-catalog-service.yaml
+            git commit -m "ci(drug-catalog): seed qa values file [skip ci]"
+            git push
+          fi
+      - uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    envs/qa/values-catalog-service.yaml
+          yq_expression:  ".image.tag = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_tag }}
+          commit_message: "ci(drug-catalog): qa → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          chmod +x /usr/local/bin/argocd
+      - name: Wait for ArgoCD QA sync
+        env:
+          ARGOCD_SERVER:     ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_OPTS:       "--grpc-web"
+        run: argocd app wait pharma-qa --health --sync --timeout 600
+
+  promote-prod:
+    name: "Promote → PROD (manual gate)"
+    needs: [build, promote-qa]
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - name: Seed prod values file if missing
+        run: |
+          git clone \
+            "https://x-access-token:${{ secrets.GITOPS_TOKEN }}@github.com/${{ github.repository_owner }}/pharmops-gitops.git" \
+            _gitops
+          if [ ! -f _gitops/envs/prod/values-catalog-service.yaml ]; then
+            cp _gitops/envs/qa/values-catalog-service.yaml \
+               _gitops/envs/prod/values-catalog-service.yaml
+            sudo wget -qO /usr/local/bin/yq \
+              https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+            yq e -i '.configmap.SPRING_PROFILES_ACTIVE = "prod"' \
+              _gitops/envs/prod/values-catalog-service.yaml
+            yq e -i '.replicaCount = 2' \
+              _gitops/envs/prod/values-catalog-service.yaml
+            yq e -i '.configmap.LOG_LEVEL = "WARN"' \
+              _gitops/envs/prod/values-catalog-service.yaml
+            cd _gitops
+            git config user.name  "pharma-ci-bot"
+            git config user.email "ci-bot@pharma.internal"
+            git add envs/prod/values-catalog-service.yaml
+            git commit -m "ci(drug-catalog): seed prod values file [skip ci]"
+            git push
+          fi
+      - uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    envs/prod/values-catalog-service.yaml
+          yq_expression:  ".image.tag = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_tag }}
+          commit_message: "ci(drug-catalog): prod → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}

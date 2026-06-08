@@ -1,0 +1,186 @@
+##############################################################################
+# Reusable workflow: Node.js — Build → Test → SAST → Scan → Sign → Push
+#
+# Called by:  ci-notification.yml, ci-pharma-ui.yml
+##############################################################################
+name: "[reusable] Node.js Build, Scan & Sign"
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        type: string
+        required: true
+      ecr_repository:
+        type: string
+        required: true
+      docker_context:
+        type: string
+        required: true
+      run_tests:
+        description: "Whether to run npm test (false for React build-only)"
+        type: boolean
+        default: true
+
+    outputs:
+      image_tag:
+        value: ${{ jobs.build.outputs.image_tag }}
+      image_uri:
+        value: ${{ jobs.build.outputs.image_uri }}
+
+    secrets:
+      AWS_ACCOUNT_ID:
+        required: true
+      GITHUB_ACTIONS_ROLE_ARN:
+        required: true
+
+jobs:
+  build:
+    name: "Build · SAST · Container Scan · Sign"
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+      image_uri: ${{ steps.meta.outputs.uri }}
+
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+      actions: read
+
+    steps:
+      # ── 1. Source ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TAG="sha-${SHORT_SHA}"
+          REGISTRY="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com"
+          URI="${REGISTRY}/${{ inputs.ecr_repository }}:${TAG}"
+          echo "tag=${TAG}"      >> $GITHUB_OUTPUT
+          echo "uri=${URI}"      >> $GITHUB_OUTPUT
+          echo "registry=${REGISTRY}" >> $GITHUB_OUTPUT
+
+      # ── 2. Node.js Build & Tests ───────────────────────────────────────────
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: "${{ inputs.docker_context }}/package-lock.json"
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.docker_context }}
+        run: npm ci
+
+      - name: Run tests
+        if: inputs.run_tests
+        working-directory: ${{ inputs.docker_context }}
+        run: npm test -- --passWithNoTests --ci --coverage
+
+      - name: Build (React production bundle)
+        if: "!inputs.run_tests"
+        working-directory: ${{ inputs.docker_context }}
+        run: npm run build
+
+      # ── 3. SAST ────────────────────────────────────────────────────────────
+      - name: Initialize CodeQL (JavaScript/TypeScript)
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+
+      - name: CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "${{ inputs.service_name }}-js"
+
+      - name: Semgrep SAST
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/javascript
+            p/nodejs
+            p/owasp-top-ten
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: OWASP Dependency Check (npm audit)
+        working-directory: ${{ inputs.docker_context }}
+        run: |
+          npm audit --audit-level=high --json > npm-audit.json || true
+          # Fail if any HIGH or CRITICAL found
+          CRITICAL=$(jq '.metadata.vulnerabilities.critical // 0' npm-audit.json)
+          HIGH=$(jq '.metadata.vulnerabilities.high // 0' npm-audit.json)
+          echo "Critical: $CRITICAL  High: $HIGH"
+          [ "$CRITICAL" -eq 0 ] && [ "$HIGH" -eq 0 ]
+
+      # ── 4. Docker Build ────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.docker_context }}
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.uri }}
+          cache-from: type=gha,scope=${{ inputs.service_name }}
+          cache-to:   type=gha,scope=${{ inputs.service_name }},mode=max
+
+      # ── 5. Trivy ───────────────────────────────────────────────────────────
+      - name: Trivy — image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:      ${{ steps.meta.outputs.uri }}
+          format:         sarif
+          output:         trivy-results.sarif
+          severity:       CRITICAL,HIGH
+          exit-code:      "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: "trivy-${{ inputs.service_name }}"
+
+      # ── 6. ECR Push ────────────────────────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image to ECR
+        run: docker push ${{ steps.meta.outputs.uri }}
+
+      # ── 7. Cosign Keyless Sign ─────────────────────────────────────────────
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        run: |
+          cosign sign --yes \
+            --rekor-url https://rekor.sigstore.dev \
+            "${{ steps.meta.outputs.uri }}"
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+
+      - name: Verify signature (self-check)
+        run: |
+          cosign verify \
+            --certificate-identity-regexp \
+              "https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}.*" \
+            --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+            "${{ steps.meta.outputs.uri }}"

@@ -1,0 +1,115 @@
+##############################################################################
+# CI/CD Pipeline — notification-service  (Node.js / Express)
+##############################################################################
+name: "CI/CD — notification-service"
+
+on:
+  push:
+    branches:
+      - develop
+      - "release/**"
+      - main
+    paths:
+      - "services/notification-service/**"
+      - ".github/workflows/ci-notification.yml"
+      - ".github/workflows/_node-build.yml"
+  pull_request:
+    branches:
+      - develop
+    paths:
+      - "services/notification-service/**"
+
+concurrency:
+  group: notification-service-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/_node-build.yml
+    with:
+      service_name:   notification-service
+      ecr_repository: notification-service
+      docker_context: services/notification-service
+      run_tests:      true
+    secrets:
+      AWS_ACCOUNT_ID:          ${{ secrets.AWS_ACCOUNT_ID }}
+      GITHUB_ACTIONS_ROLE_ARN: ${{ secrets.GITHUB_ACTIONS_ROLE_ARN }}
+
+  deploy-dev:
+    name: "Deploy → DEV"
+    needs: build
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    envs/dev/values-notification-service.yaml
+          yq_expression:  ".image.tag = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_tag }}
+          commit_message: "ci(notification): dev → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          chmod +x /usr/local/bin/argocd
+      - name: Wait for ArgoCD DEV sync
+        env:
+          ARGOCD_SERVER:     ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_OPTS:       "--grpc-web"
+        run: argocd app wait notification-service-dev --health --sync --timeout 300
+
+  promote-qa:
+    name: "Promote → QA"
+    needs: [build, deploy-dev]
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    envs/qa/values-notification-service.yaml
+          yq_expression:  ".image.tag = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_tag }}
+          commit_message: "ci(notification): qa → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          chmod +x /usr/local/bin/argocd
+      - name: Wait for ArgoCD QA sync
+        env:
+          ARGOCD_SERVER:     ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_OPTS:       "--grpc-web"
+        run: argocd app wait pharma-qa --health --sync --timeout 600
+
+  promote-prod:
+    name: "Promote → PROD (manual gate)"
+    needs: [build, promote-qa]
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    envs/prod/values-notification-service.yaml
+          yq_expression:  ".image.tag = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_tag }}
+          commit_message: "ci(notification): prod → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}

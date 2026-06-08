@@ -1,0 +1,202 @@
+##############################################################################
+# Reusable workflow: Java / Spring Boot — Build → Test → SAST → Scan → Sign → Push
+#
+# Called by:  ci-api-gateway.yml, ci-auth-service.yml, ci-drug-catalog.yml
+# Pattern   : Build ONCE here. The same image tag flows dev → qa → prod.
+##############################################################################
+name: "[reusable] Java Build, Scan & Sign"
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: "Short service identifier (e.g. api-gateway)"
+        type: string
+        required: true
+      ecr_repository:
+        description: "ECR repo name (e.g. api-gateway)"
+        type: string
+        required: true
+      docker_context:
+        description: "Path to service root containing Dockerfile"
+        type: string
+        required: true
+
+    outputs:
+      image_tag:
+        description: "Immutable image tag  →  sha-<short-sha>"
+        value: ${{ jobs.build.outputs.image_tag }}
+      image_uri:
+        description: "Full ECR URI with tag"
+        value: ${{ jobs.build.outputs.image_uri }}
+
+    secrets:
+      AWS_ACCOUNT_ID:
+        required: true
+      GITHUB_ACTIONS_ROLE_ARN:
+        required: true
+
+jobs:
+  build:
+    name: "Build · SAST · Container Scan · Sign"
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+      image_uri: ${{ steps.meta.outputs.uri }}
+
+    permissions:
+      contents: read
+      security-events: write   # upload SARIF to GitHub Security tab
+      id-token: write          # AWS OIDC + Cosign keyless signing
+      actions: read
+
+    steps:
+      # ── 1. Source ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TAG="sha-${SHORT_SHA}"
+          REGISTRY="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com"
+          URI="${REGISTRY}/${{ inputs.ecr_repository }}:${TAG}"
+          echo "tag=${TAG}"      >> $GITHUB_OUTPUT
+          echo "uri=${URI}"      >> $GITHUB_OUTPUT
+          echo "registry=${REGISTRY}" >> $GITHUB_OUTPUT
+
+      # ── 2. Java Build & Unit Tests ─────────────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: maven
+
+      - name: Build JAR (skip tests — run separately for clearer reporting)
+        working-directory: ${{ inputs.docker_context }}
+        run: mvn -B package -DskipTests
+
+      - name: Unit tests + coverage
+        working-directory: ${{ inputs.docker_context }}
+        run: mvn -B verify -Pcoverage
+        # Fails build if Jacoco coverage < configured threshold in pom.xml
+
+      # ── 3. SAST ────────────────────────────────────────────────────────────
+      - name: Initialize CodeQL (Java)
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java
+          queries: security-extended,security-and-quality
+
+      - name: CodeQL autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "${{ inputs.service_name }}-java"
+
+      - name: Semgrep SAST
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/java
+            p/owasp-top-ten
+            p/spring-boot
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: ${{ inputs.service_name }}
+          path: ${{ inputs.docker_context }}
+          format: SARIF
+          args: >
+            --failOnCVSS 7
+            --enableRetired
+            --suppressionFile .github/owasp-suppressions.xml
+        env:
+          JAVA_HOME: /opt/jdk
+
+      - name: Upload OWASP SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/dependency-check-report.sarif
+          category: "owasp-${{ inputs.service_name }}"
+
+      # ── 4. Docker Build ────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (local, not pushed yet)
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.docker_context }}
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.uri }}
+          cache-from: type=gha,scope=${{ inputs.service_name }}
+          cache-to:   type=gha,scope=${{ inputs.service_name }},mode=max
+
+      # ── 5. Container Vulnerability Scan (Trivy) ───────────────────────────
+      - name: Trivy — image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:    ${{ steps.meta.outputs.uri }}
+          format:       sarif
+          output:       trivy-results.sarif
+          severity:     CRITICAL,HIGH
+          exit-code:    "1"          # fails the build on HIGH/CRITICAL
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: "trivy-${{ inputs.service_name }}"
+
+      # ── 6. AWS Login & ECR Push ───────────────────────────────────────────
+      - name: Configure AWS credentials (OIDC — no long-lived keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image to ECR
+        run: docker push ${{ steps.meta.outputs.uri }}
+
+      # ── 7. Cosign Keyless Signing ─────────────────────────────────────────
+      #
+      # No key management needed.  Cosign requests a short-lived certificate
+      # from Sigstore Fulcio bound to the GitHub Actions OIDC identity.
+      # The signing event is recorded in the Rekor transparency log.
+      # Signature is stored as an OCI artifact alongside the image in ECR.
+      #
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        run: |
+          cosign sign --yes \
+            --rekor-url https://rekor.sigstore.dev \
+            "${{ steps.meta.outputs.uri }}"
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+
+      - name: Verify signature (self-check)
+        run: |
+          cosign verify \
+            --certificate-identity-regexp \
+              "https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}.*" \
+            --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+            "${{ steps.meta.outputs.uri }}"

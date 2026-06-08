@@ -1,0 +1,138 @@
+##############################################################################
+# CI/CD Pipeline — pharma-ui  (React 18 / Nginx)
+#
+# DIFFERENCE vs other services:
+#   pharma-ui uses RAW Kubernetes manifests (k8s-manifests/pharma-ui/deployment.yaml)
+#   NOT a Helm values file.  So the gitops update patches the full image URI
+#   in .spec.template.spec.containers[0].image instead of .image.tag
+##############################################################################
+name: "CI/CD — pharma-ui"
+
+on:
+  push:
+    branches:
+      - develop
+      - "release/**"
+      - main
+    paths:
+      - "services/pharma-ui/**"
+      - ".github/workflows/ci-pharma-ui.yml"
+      - ".github/workflows/_node-build.yml"
+  pull_request:
+    branches:
+      - develop
+    paths:
+      - "services/pharma-ui/**"
+
+concurrency:
+  group: pharma-ui-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # run_tests: false → runs 'npm run build' instead of 'npm test'
+    uses: ./.github/workflows/_node-build.yml
+    with:
+      service_name:   pharma-ui
+      ecr_repository: pharma-ui
+      docker_context: services/pharma-ui
+      run_tests:      false
+    secrets:
+      AWS_ACCOUNT_ID:          ${{ secrets.AWS_ACCOUNT_ID }}
+      GITHUB_ACTIONS_ROLE_ARN: ${{ secrets.GITHUB_ACTIONS_ROLE_ARN }}
+
+  deploy-dev:
+    name: "Deploy → DEV"
+    needs: build
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      # pharma-ui uses raw K8s manifests — patch the full container image URI
+      - uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    k8s-manifests/pharma-ui/deployment.yaml
+          yq_expression:  ".spec.template.spec.containers[0].image = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_uri }}
+          commit_message: "ci(pharma-ui): dev → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          chmod +x /usr/local/bin/argocd
+
+      - name: Wait for ArgoCD DEV sync
+        env:
+          ARGOCD_SERVER:     ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_OPTS:       "--grpc-web"
+        run: argocd app wait pharma-ui-dev --health --sync --timeout 300
+
+      - name: Smoke test (dev)
+        run: |
+          curl -sf --retry 5 --retry-delay 10 \
+            "https://dev.pharma.internal/" | grep -q "pharma"
+
+  promote-qa:
+    name: "Promote → QA"
+    needs: [build, deploy-dev]
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - uses: actions/checkout@v4
+      # QA has a Helm values file, unlike dev which uses raw manifests
+      - uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    envs/qa/values-pharma-ui.yaml
+          yq_expression:  ".image.tag = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_tag }}
+          commit_message: "ci(pharma-ui): qa → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          chmod +x /usr/local/bin/argocd
+      - name: Wait for ArgoCD QA sync
+        env:
+          ARGOCD_SERVER:     ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_OPTS:       "--grpc-web"
+        run: argocd app wait pharma-qa --health --sync --timeout 600
+
+      - name: DAST — ZAP Baseline Scan (Frontend, QA)
+        uses: zaproxy/action-baseline@v0.11.0
+        with:
+          target:              "https://qa.pharma.internal"
+          allow_issue_writing: true
+          fail_action:         false
+
+  promote-prod:
+    name: "Promote → PROD (manual gate)"
+    needs: [build, promote-qa]
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    envs/prod/values-pharma-ui.yaml
+          yq_expression:  ".image.tag = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_tag }}
+          commit_message: "ci(pharma-ui): prod → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}

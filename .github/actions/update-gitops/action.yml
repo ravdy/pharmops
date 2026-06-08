@@ -1,0 +1,66 @@
+name: Update GitOps Repository
+description: |
+  Clone pharmops-gitops, update the image tag (or full image URI) in a
+  values/manifest file using yq, commit, and push.  Used by every
+  service CI pipeline to propagate a new image to dev → qa → prod.
+
+inputs:
+  gitops_repo:
+    description: "owner/repo of the gitops repository"
+    required: true
+  values_file:
+    description: "Relative path inside the gitops repo to the file to patch"
+    required: true
+  yq_expression:
+    description: "yq expression to apply, e.g. '.image.tag = strenv(NEW_VALUE)'"
+    required: true
+  new_value:
+    description: "The value to set (image tag or full URI)"
+    required: true
+  commit_message:
+    description: "Git commit message"
+    required: true
+  gitops_token:
+    description: "GitHub PAT or App token with write access to gitops repo"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install yq
+      shell: bash
+      run: |
+        if ! command -v yq &>/dev/null; then
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+        fi
+
+    - name: Clone pharmops-gitops
+      shell: bash
+      run: |
+        git clone \
+          "https://x-access-token:${{ inputs.gitops_token }}@github.com/${{ inputs.gitops_repo }}.git" \
+          _gitops
+
+    - name: Patch image tag
+      shell: bash
+      working-directory: _gitops
+      env:
+        NEW_VALUE: ${{ inputs.new_value }}
+      run: |
+        yq e -i '${{ inputs.yq_expression }}' "${{ inputs.values_file }}"
+        echo "--- patched file ---"
+        cat "${{ inputs.values_file }}"
+
+    - name: Commit and push
+      shell: bash
+      working-directory: _gitops
+      run: |
+        git config user.name  "pharma-ci-bot"
+        git config user.email "ci-bot@pharma.internal"
+        git add "${{ inputs.values_file }}"
+        # no-op if nothing changed (idempotent)
+        git diff --staged --quiet && echo "No changes to commit" && exit 0
+        git commit -m "${{ inputs.commit_message }}"
+        git push

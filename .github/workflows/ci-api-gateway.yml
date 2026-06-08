@@ -1,0 +1,210 @@
+##############################################################################
+# CI/CD Pipeline — api-gateway  (Spring Boot / Maven)
+#
+# Trigger : push to develop / release/* / main  AND  path services/api-gateway/**
+# Branch  → Environment mapping
+#   develop    → DEV  (auto) → QA  (auto) → PROD gate waits for manual approval
+#   release/*  → same flow (used for hotfixes)
+#   main       → PROD only (image tag is read from what is already in QA)
+#   PR         → build + SAST only (no deploy)
+#
+# IMAGE PROMOTION PRINCIPLE:
+#   ONE image is built (tagged sha-<git-sha>).
+#   The SAME image tag is written to dev, qa, and prod values files.
+#   Nothing is ever rebuilt for QA or prod.
+##############################################################################
+name: "CI/CD — api-gateway"
+
+on:
+  push:
+    branches:
+      - develop
+      - "release/**"
+      - main
+    paths:
+      - "services/api-gateway/**"
+      - ".github/workflows/ci-api-gateway.yml"
+      - ".github/workflows/_java-build.yml"
+  pull_request:
+    branches:
+      - develop
+    paths:
+      - "services/api-gateway/**"
+
+# Cancel in-progress runs for the same branch when a new push arrives
+concurrency:
+  group: api-gateway-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. BUILD ──────────────────────────────────────────────────────────────
+  build:
+    name: "Build, Scan & Sign"
+    uses: ./.github/workflows/_java-build.yml
+    with:
+      service_name:    api-gateway
+      ecr_repository:  api-gateway
+      docker_context:  services/api-gateway
+    secrets:
+      AWS_ACCOUNT_ID:          ${{ secrets.AWS_ACCOUNT_ID }}
+      GITHUB_ACTIONS_ROLE_ARN: ${{ secrets.GITHUB_ACTIONS_ROLE_ARN }}
+
+  # ── 2. DEPLOY DEV ─────────────────────────────────────────────────────────
+  #
+  # Runs on: develop branch push only (not PRs, not main)
+  # Action : writes image tag to envs/dev/values-api-gateway.yaml
+  #          then waits for ArgoCD 'api-gateway-dev' app to become Healthy+Synced
+  #
+  deploy-dev:
+    name: "Deploy → DEV"
+    needs: build
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: dev          # GitHub Environment — no approval gate
+
+    steps:
+      - name: Checkout (for composite action)
+        uses: actions/checkout@v4
+
+      - name: Update DEV image tag in gitops repo
+        uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    envs/dev/values-api-gateway.yaml
+          yq_expression:  ".image.tag = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_tag }}
+          commit_message: "ci(api-gateway): dev → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          chmod +x /usr/local/bin/argocd
+
+      # ArgoCD polls gitops repo every 3 min by default.
+      # 'argocd app wait' blocks until the app is Synced + Healthy.
+      # Set up a webhook from pharmops-gitops → ArgoCD for instant trigger.
+      - name: Wait for ArgoCD DEV sync
+        env:
+          ARGOCD_SERVER:     ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_OPTS:       "--grpc-web"
+        run: |
+          argocd app wait api-gateway-dev \
+            --health \
+            --sync \
+            --timeout 300
+
+      - name: Verify deployment (smoke test)
+        run: |
+          # Quick HTTP check — adjust URL to your dev ingress
+          curl -sf --retry 5 --retry-delay 10 \
+            "https://dev.pharma.internal/api/actuator/health" | \
+            jq -e '.status == "UP"'
+
+  # ── 3. PROMOTE → QA ───────────────────────────────────────────────────────
+  #
+  # Runs automatically after deploy-dev succeeds.
+  # Writes the SAME image tag (sha-xxx) to envs/qa/values-api-gateway.yaml.
+  # No rebuild.  No new image.  Same bytes.
+  #
+  promote-qa:
+    name: "Promote → QA"
+    needs: [build, deploy-dev]
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: qa           # GitHub Environment — can add auto-approval rules
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update QA image tag in gitops repo
+        uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    envs/qa/values-api-gateway.yaml
+          yq_expression:  ".image.tag = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_tag }}
+          commit_message: "ci(api-gateway): qa → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          chmod +x /usr/local/bin/argocd
+
+      - name: Wait for ArgoCD QA sync
+        env:
+          ARGOCD_SERVER:     ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_OPTS:       "--grpc-web"
+        run: |
+          argocd app wait pharma-qa \
+            --health \
+            --sync \
+            --timeout 600
+
+      # ── DAST on QA ────────────────────────────────────────────────────────
+      - name: DAST — ZAP Baseline Scan (QA)
+        uses: zaproxy/action-baseline@v0.11.0
+        with:
+          target:              "https://qa.pharma.internal/api"
+          allow_issue_writing: true    # opens GitHub issues for findings
+          fail_action:         false   # report only; block via ZAP rules file for HIGH
+
+      - name: DAST — ZAP API Scan (QA)
+        uses: zaproxy/action-api-scan@v0.7.0
+        with:
+          target:     "https://qa.pharma.internal/api/v3/api-docs"
+          format:     openapi
+          fail_action: true   # blocks promotion if new HIGH findings vs baseline
+
+  # ── 4. PROMOTE → PROD ─────────────────────────────────────────────────────
+  #
+  # GitHub Environment 'prod' is configured in repo Settings → Environments with:
+  #   - Required reviewers: QA Lead + Release Manager
+  #   - Wait timer: 0 (immediate after approval)
+  # The job waits for human approval BEFORE touching the prod values file.
+  #
+  # ArgoCD prod app has syncPolicy: Manual — it shows OutOfSync after this job.
+  # A DevOps engineer then triggers the actual sync in the ArgoCD UI or CLI.
+  #
+  promote-prod:
+    name: "Promote → PROD (manual gate)"
+    needs: [build, promote-qa]
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    environment: prod         # ← BLOCKS here until reviewer approves in GitHub UI
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update PROD image tag in gitops repo
+        uses: ./.github/actions/update-gitops
+        with:
+          gitops_repo:    ${{ github.repository_owner }}/pharmops-gitops
+          values_file:    envs/prod/values-api-gateway.yaml
+          yq_expression:  ".image.tag = strenv(NEW_VALUE)"
+          new_value:      ${{ needs.build.outputs.image_tag }}
+          commit_message: "ci(api-gateway): prod → ${{ needs.build.outputs.image_tag }} [skip ci]"
+          gitops_token:   ${{ secrets.GITOPS_TOKEN }}
+
+      # ArgoCD prod app is Manual sync — this step only NOTIFIES, does not auto-sync
+      - name: Notify ArgoCD prod is ready to sync
+        run: |
+          echo "::notice title=PROD Ready::api-gateway prod values updated to ${{ needs.build.outputs.image_tag }}"
+          echo "::notice title=Action Required::Open ArgoCD UI and sync 'pharma-prod' app to complete deployment"
+
+      - name: Post deployment record
+        run: |
+          echo "IMAGE_TAG=${{ needs.build.outputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "IMAGE_URI=${{ needs.build.outputs.image_uri }}" >> $GITHUB_STEP_SUMMARY
+          echo "PROMOTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"   >> $GITHUB_STEP_SUMMARY
